@@ -13,20 +13,23 @@ import jetbrains.buildServer.runner.JavaRunnerConstants;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang.SystemUtils;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.teamcity.rest.Build;
+import org.jetbrains.teamcity.rest.BuildConfigurationId;
+import org.jetbrains.teamcity.rest.BuildLocator;
+import org.jetbrains.teamcity.rest.TeamCityInstanceFactory;
+
+import kotlin.sequences.Sequence;
 
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -53,6 +56,8 @@ class AllureBuildServiceAdapter extends BuildServiceAdapter {
     private static final String ARCHIVE_NAME = "allure-report.zip";
 
     private static final String ALLURE_EXEC_NAME = "allure";
+
+    private static final int LAST_FINISHED_BUILDS_MAX = 10;
 
     /**
      * Can be used to notify agent artifacts publisher about new artifacts to be
@@ -214,46 +219,45 @@ class AllureBuildServiceAdapter extends BuildServiceAdapter {
      */
     private void copyHistory() {
         try {
-            copyHistoryFormLastFinishedBuild(new URL(getLastFinishedArtifactUrl(ALLURE_ARTIFACT_HISTORY_LOCATION)));
-            copyHistoryFormLastFinishedBuild(new URL(getLastFinishedArtifactUrl()));
+            Iterator<Build> buildsIterator = getLastFinishedBuilds().iterator();
+
+            while (buildsIterator.hasNext() && !historyExists()) {
+                Build build = buildsIterator.next();
+                copyHistoryFromBuild(build, ALLURE_ARTIFACT_HISTORY_LOCATION);
+                copyHistoryFromBuild(build, ARCHIVE_NAME);
+            }
         } catch (IOException e) {
             getLogger().message("Cannot copy history file. Reason: " + e.getMessage());
             getLogger().exception(e);
         }
     }
 
-    private void copyHistoryFormLastFinishedBuild(URL url) throws IOException {
-        getLogger().message(format("Search allure history information in [%s] ...", url.toString()));
-        Path lastFinishedArtifactZip = Files.createTempFile("artifact", String.valueOf(getBuild().getBuildId()));
+    private void copyHistoryFromBuild(Build build, String artifactDependencies) throws IOException {
+        getLogger().message(format("Search allure history information in %s #%s ...",
+                build.getBuildConfigurationId(), build.getBuildNumber()));
 
+        if (historyExists()) return;
+
+        Path artifactsZip = Files.createTempFile("artifact", String.valueOf(getBuild().getBuildId()));
+
+        try {
+            build.downloadArtifact(artifactDependencies, Files.newOutputStream(artifactsZip));
+        } catch (Exception e) {
+            getLogger().message("Cannot download artifact. Reason: " + e.getMessage());
+            return;
+        }
+
+        getLogger().message("Coping allure history information ...");
+        try (ZipFile archive = new ZipFile(artifactsZip.toString())) {
+            copyHistoryToResultsPath(archive, resultsDirectory);
+        }
+    }
+
+    private boolean historyExists() throws IOException {
         Path historyDirectory = resultsDirectory.resolve("history");
         Files.createDirectories(historyDirectory);
 
-        if (Files.list(historyDirectory).count() != 0) {
-            getLogger().message("Allure history information already exists ...");
-            return;
-        }
-
-        String password = getServerAuthentication();
-        String encoding = Base64.getUrlEncoder().encodeToString(password.getBytes("utf-8"));
-
-        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-        connection.setRequestProperty("Authorization", "Basic " + encoding);
-        connection.connect();
-
-        boolean isArtifactMissing = connection.getResponseCode() != 200;
-        if (isArtifactMissing) {
-            getLogger().message(format("Allure history information missing in [%s] ...", url.toString()));
-            return;
-        }
-
-        getLogger().message(format("Coping allure history information from [%s] ...", url.toString()));
-        try (InputStream stream = connection.getInputStream()) {
-            Files.copy(stream, lastFinishedArtifactZip, StandardCopyOption.REPLACE_EXISTING);
-            try (ZipFile archive = new ZipFile(lastFinishedArtifactZip.toString())) {
-                copyHistoryToResultsPath(archive, resultsDirectory);
-            }
-        }
+        return Files.list(historyDirectory).count() != 0;
     }
 
     private void copyHistoryToResultsPath(ZipFile archive, Path resultsDirectory) throws IOException {
@@ -286,46 +290,38 @@ class AllureBuildServiceAdapter extends BuildServiceAdapter {
     }
 
     /**
-     * Returns the build's artifacts url for the last finished build.
-     *
-     * @see #getTeamcityBaseUrl()
+     * Returns the sequence of finished builds for current build configuration
+     */
+    private Sequence<Build> getLastFinishedBuilds() {
+        BuildConfigurationId buildConfigurationId = new BuildConfigurationId(getBuild().getBuildTypeExternalId());
+
+        BuildLocator buildLocator = TeamCityInstanceFactory.httpAuth(getTeamcityBaseUrl(), getAuthUserId(), getAuthPassword())
+                .builds()
+                .fromConfiguration(buildConfigurationId)
+                .includeFailed()
+                .limitResults(LAST_FINISHED_BUILDS_MAX);
+
+        String branch = getConfigParameters().get("teamcity.build.branch");
+        if (Objects.nonNull(branch)) {
+            buildLocator.withBranch(branch);
+        }
+        return buildLocator.all();
+    }
+
+    /**
+     * Returns teamcity auth userId.
      */
     @NotNull
-    private String getLastFinishedArtifactUrl() {
-        StringBuilder artifactUrl = new StringBuilder();
-        artifactUrl.append(format(
-                "%s/repository/downloadAll/%s/.lastFinished/artifacts.zip",
-                getTeamcityBaseUrl(),
-                getBuild().getBuildTypeExternalId()));
-        String branch = getConfigParameters().get("teamcity.build.branch");
-        if (Objects.nonNull(branch)) {
-            artifactUrl.append(format("?branch=%s", branch));
-        }
-        return artifactUrl.toString();
+    private String getAuthUserId() {
+        return getSystemProperties().get("teamcity.auth.userId");
     }
 
-    private String getLastFinishedArtifactUrl(String name) {
-        return getArtifactUrl(".lastFinished", name);
-    }
-
-    private String getArtifactUrl(String build, String name) {
-        StringBuilder artifactUrl = new StringBuilder();
-        artifactUrl.append(format("%s/repository/download/%s/%s/%s",
-                getTeamcityBaseUrl(), getBuild().getBuildTypeExternalId(), build, name));
-        String branch = getConfigParameters().get("teamcity.build.branch");
-        if (Objects.nonNull(branch)) {
-            artifactUrl.append(format("?branch=%s", branch));
-        }
-        return artifactUrl.toString();
-    }
-
+    /**
+     * Returns teamcity auth password.
+     */
     @NotNull
-    private String getServerAuthentication() {
-        return format(
-                "%s:%s",
-                getSystemProperties().get("teamcity.auth.userId"),
-                getSystemProperties().get("teamcity.auth.password")
-        );
+    private String getAuthPassword() {
+        return getSystemProperties().get("teamcity.auth.password");
     }
 
     /**
@@ -339,7 +335,16 @@ class AllureBuildServiceAdapter extends BuildServiceAdapter {
         String artifactPath = publishMode.equals(AllurePublishMode.ARCHIVE)
                 ? String.format("%s!/%s/index.html", ARCHIVE_NAME, reportDirectoryName)
                 : String.format("%s/index.html", reportDirectoryName);
-        return getArtifactUrl(format("%s:id", getBuild().getBuildId()), artifactPath);
+
+        StringBuilder artifactUrl = new StringBuilder();
+        artifactUrl.append(format("%s/repository/download/%s/%s/%s",
+                getTeamcityBaseUrl(), getBuild().getBuildTypeExternalId(), getBuild().getBuildId(), artifactPath));
+
+        String branch = getConfigParameters().get("teamcity.build.branch");
+        if (Objects.nonNull(branch)) {
+            artifactUrl.append(format("?branch=%s", branch));
+        }
+        return artifactUrl.toString();
     }
 
     private String getBuildNumber() {

@@ -21,6 +21,9 @@ dependencies {
     compile 'commons-logging:commons-logging:1.1.3'
     compile 'commons-httpclient:commons-httpclient:3.1'
     compile 'org.apache.commons:commons-compress:1.16.1'
+    compile ('org.jetbrains.teamcity:teamcity-rest-client:1.7.26') {
+        exclude group: 'org.slf4j'
+    }
 
     provided 'com.intellij:openapi:7.0.3'
     provided "org.jetbrains.teamcity:agent-api:${teamcityVersion}"
